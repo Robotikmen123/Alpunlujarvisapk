@@ -1,0 +1,33 @@
+name: Build APK
+
+# JARVIS Android — buludda otomatik APK derlemesi.
+# Her push'ta veya GitHub arayüzünden elle çalıştırıldığında buildozer ile
+# bir debug APK üretir ve indirilebilir bir artifact olarak yayınlar.
+
+on:
+  push:
+    branches:
+      - claude/android-apk-preparation-cm6E8
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Depoyu çek
+        uses: actions/checkout@v4
+
+      - name: Buildozer ile APK derle
+        uses: ArtemSBulgakov/buildozer-action@v1
+        with:
+          command: buildozer android debug
+          buildozer_version: stable
+
+      - name: APK'yı artifact olarak yükle
+        uses: actions/upload-artifact@v4
+        with:
+          name: jarvis-apk
+          path: bin/*.apk
+          if-no-files-found: error
