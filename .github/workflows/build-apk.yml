@@ -1,8 +1,8 @@
 name: Build APK
 
-# JARVIS Android — buludda otomatik APK derlemesi.
-# Her push'ta veya GitHub arayüzünden elle çalıştırıldığında buildozer ile
-# bir debug APK üretir ve indirilebilir bir artifact olarak yayınlar.
+# JARVIS Android — bulutta otomatik APK derlemesi.
+# Her push'ta veya elle çalıştırıldığında buildozer ile debug APK üretir
+# ve indirilebilir bir artifact olarak yayınlar.
 
 on:
   push:
@@ -12,18 +12,55 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # buildozer / python-for-android ile en uyumlu çalışan sürüm
+    runs-on: ubuntu-22.04
     timeout-minutes: 120
 
     steps:
       - name: Depoyu çek
         uses: actions/checkout@v4
 
-      - name: Buildozer ile APK derle
-        uses: ArtemSBulgakov/buildozer-action@v1
+      - name: Python kur
+        uses: actions/setup-python@v5
         with:
-          command: buildozer android debug
-          buildozer_version: stable
+          python-version: '3.11'
+
+      - name: JDK 17 kur
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Sistem bağımlılıklarını kur
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git zip unzip autoconf libtool pkg-config cmake \
+            build-essential ccache libltdl-dev \
+            zlib1g-dev libncurses-dev libncursesw5-dev libtinfo5 \
+            libffi-dev libssl-dev
+
+      - name: buildozer ve cython kur
+        run: |
+          python -m pip install --upgrade pip
+          pip install --upgrade buildozer cython
+
+      - name: buildozer global önbelleği
+        uses: actions/cache@v4
+        with:
+          path: ~/.buildozer
+          key: buildozer-global-${{ hashFiles('buildozer.spec') }}
+          restore-keys: buildozer-global-
+
+      - name: buildozer proje önbelleği
+        uses: actions/cache@v4
+        with:
+          path: .buildozer
+          key: buildozer-project-${{ hashFiles('buildozer.spec') }}
+          restore-keys: buildozer-project-
+
+      - name: APK derle
+        run: buildozer android debug
 
       - name: APK'yı artifact olarak yükle
         uses: actions/upload-artifact@v4
@@ -31,3 +68,11 @@ jobs:
           name: jarvis-apk
           path: bin/*.apk
           if-no-files-found: error
+
+      - name: Derleme logunu yükle (hata ayıklama)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: .buildozer/**/*.log
+          if-no-files-found: ignore
