@@ -33,7 +33,11 @@ buildozer -v android debug
 ```
 
 Üretilen APK `bin/` klasörüne yazılır. İlk derleme Android SDK/NDK indireceği
-için uzun sürer. `pydantic-core` derlemesi için derleme ortamında Rust gerekir.
+için uzun sürer. Tüm bağımlılıklar saf Python olduğundan derlenmiş/Rust
+bağımlılığı gerekmez.
+
+Alternatif olarak `.github/workflows/build-apk.yml` iş akışı, her push'ta APK'yı
+GitHub Actions üzerinde otomatik derler ve artifact olarak yayınlar.
 
 ## Kurulum / kullanım
 

@@ -1,15 +1,19 @@
 # Alp Ünlü tarafından yapılmıştır — @alppunlu
-# Android port — ekran analizi MediaProjection + Gemini vision ile yapılır.
+# Android port — ekran analizi MediaProjection + Gemini vision (REST) ile yapılır.
+#
+# google-genai SDK'sı yerine Gemini generateContent REST uç noktasına doğrudan
+# `requests` ile bağlanılır; böylece Rust tabanlı bağımlılık (pydantic-core)
+# gerekmez ve APK temiz derlenir.
 from __future__ import annotations
 
+import base64
 import io
 import mimetypes
 import tempfile
 import time
 from pathlib import Path
 
-from google import genai
-from google.genai import errors, types
+import requests
 from PIL import Image, ImageStat
 
 from app_config import get_app_config_value
@@ -24,6 +28,7 @@ VISION_MODELS = (
 )
 VISION_MAX_DIMENSION = 1800
 VISION_MAX_INLINE_BYTES = 5_500_000
+API_ROOT = "https://generativelanguage.googleapis.com/v1beta"
 
 
 def _screen_permission_message() -> str:
@@ -48,7 +53,8 @@ def _image_looks_blank(image_path: Path) -> bool:
         return False
 
 
-def _build_image_part(image_path: Path) -> types.Part:
+def _build_image_part(image_path: Path) -> dict:
+    """Görüntüyü Gemini REST API için inlineData parçasına dönüştürür."""
     mime_type, _ = mimetypes.guess_type(str(image_path))
     if not mime_type:
         mime_type = "image/png"
@@ -63,13 +69,16 @@ def _build_image_part(image_path: Path) -> types.Part:
         work.save(png_buffer, format="PNG", optimize=True)
         png_bytes = png_buffer.getvalue()
         if len(png_bytes) <= VISION_MAX_INLINE_BYTES:
-            return types.Part.from_bytes(data=png_bytes, mime_type="image/png")
+            return {"inlineData": {"mimeType": "image/png",
+                                   "data": base64.b64encode(png_bytes).decode("ascii")}}
         jpg_buffer = io.BytesIO()
         rgb = work.convert("RGB") if work.mode != "RGB" else work
         rgb.save(jpg_buffer, format="JPEG", quality=88, optimize=True)
-        return types.Part.from_bytes(data=jpg_buffer.getvalue(), mime_type="image/jpeg")
+        return {"inlineData": {"mimeType": "image/jpeg",
+                               "data": base64.b64encode(jpg_buffer.getvalue()).decode("ascii")}}
     except Exception:
-        return types.Part.from_bytes(data=image_path.read_bytes(), mime_type=mime_type)
+        return {"inlineData": {"mimeType": mime_type,
+                               "data": base64.b64encode(image_path.read_bytes()).decode("ascii")}}
 
 
 def _vision_prompt(query: str) -> str:
@@ -88,50 +97,35 @@ def _vision_prompt(query: str) -> str:
     )
 
 
-def _extract_response_text(response) -> str:
-    text = str(getattr(response, "text", "") or "").strip()
-    if text:
-        return text
-    candidates = getattr(response, "candidates", None) or []
+def _extract_response_text(payload: dict) -> str:
     chunks: list[str] = []
-    for candidate in candidates:
-        content = getattr(candidate, "content", None)
-        parts = getattr(content, "parts", None) or []
-        for part in parts:
-            part_text = str(getattr(part, "text", "") or "").strip()
-            if part_text:
-                chunks.append(part_text)
-    return "\n".join(chunk for chunk in chunks if chunk).strip()
+    for candidate in payload.get("candidates", []) or []:
+        content = candidate.get("content") or {}
+        for part in content.get("parts", []) or []:
+            text = str(part.get("text", "") or "").strip()
+            if text:
+                chunks.append(text)
+    return "\n".join(chunks).strip()
 
 
-def _is_transient_vision_error(exc: Exception) -> bool:
-    if isinstance(exc, (errors.ServerError, TimeoutError)):
+def _is_transient_status(status: int, message: str) -> bool:
+    if status in (500, 502, 503, 504, 429):
         return True
-    message = str(exc or "").lower()
+    low = message.lower()
     transient_markers = (
-        "503", "429", "deadline", "timed out", "timeout", "unavailable",
-        "temporarily unavailable", "service unavailable", "internal error",
-        "busy", "overloaded", "resource exhausted", "try again later",
-        "backend error", "connection reset",
+        "deadline", "timed out", "timeout", "unavailable", "internal error",
+        "busy", "overloaded", "try again later", "backend error", "connection reset",
     )
-    return any(marker in message for marker in transient_markers)
+    return any(marker in low for marker in transient_markers)
 
 
-def _is_quota_vision_error(exc: Exception) -> bool:
-    message = str(exc or "").lower()
-    quota_markers = (
-        "quota", "rate limit", "resource exhausted", "too many requests",
-        "quota exceeded", "limit exceeded", "billing",
-    )
-    return any(marker in message for marker in quota_markers)
-
-
-def _friendly_vision_error(exc: Exception) -> str:
-    if _is_quota_vision_error(exc):
-        return "Gemini vision istegi kota veya hiz limitine takildi. Biraz bekleyip tekrar dene ya da API planini kontrol et."
-    if _is_transient_vision_error(exc):
-        return "Gemini vision servisi su anda yogun veya gecici olarak ulasilamiyor. Biraz sonra tekrar dene."
-    return f"Gemini vision istegi basarisiz oldu: {exc}"
+def _is_quota_status(status: int, message: str) -> bool:
+    if status == 429:
+        return True
+    low = message.lower()
+    quota_markers = ("quota", "rate limit", "resource exhausted",
+                     "too many requests", "limit exceeded", "billing")
+    return any(marker in low for marker in quota_markers)
 
 
 def _analyze_with_gemini(query: str, image_path: Path) -> str:
@@ -140,34 +134,57 @@ def _analyze_with_gemini(query: str, image_path: Path) -> str:
         return "Gemini API anahtari eksik oldugu icin ekran analizi yapilamadi."
 
     prompt = _vision_prompt(query)
-    client = genai.Client(api_key=api_key)
     image_part = _build_image_part(image_path)
+    body = {
+        "contents": [{"parts": [{"text": prompt}, image_part]}],
+        "generationConfig": {"temperature": 0.2},
+    }
     retry_delays = (0.9, 1.8, 3.0)
-    last_error: Exception | None = None
+    last_error = "Bilinmeyen hata"
 
     for model_name in VISION_MODELS:
         for attempt, delay in enumerate(retry_delays, start=1):
             try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=[types.Part.from_text(text=prompt), image_part],
-                    config=types.GenerateContentConfig(temperature=0.2),
+                response = requests.post(
+                    f"{API_ROOT}/{model_name}:generateContent",
+                    params={"key": api_key},
+                    json=body,
+                    timeout=45,
+                    headers={"User-Agent": "JARVIS Android"},
                 )
-                merged = _extract_response_text(response)
-                if merged:
-                    return merged
-                raise RuntimeError("Gemini gecerli bir ekran analizi metni dondurmedi.")
             except Exception as exc:
-                last_error = exc
-                if attempt < len(retry_delays) and _is_transient_vision_error(exc):
+                last_error = str(exc)
+                if attempt < len(retry_delays):
                     time.sleep(delay)
                     continue
-                if _is_transient_vision_error(exc):
-                    break
-                raise RuntimeError(_friendly_vision_error(exc)) from exc
+                break
 
-    assert last_error is not None
-    raise RuntimeError(_friendly_vision_error(last_error))
+            if response.ok:
+                merged = _extract_response_text(response.json())
+                if merged:
+                    return merged
+                last_error = "Gemini gecerli bir ekran analizi metni dondurmedi."
+                break
+
+            try:
+                err = response.json().get("error", {})
+                message = str(err.get("message", "") or "")
+            except Exception:
+                message = response.text[:200]
+            last_error = message or f"HTTP {response.status_code}"
+
+            if _is_quota_status(response.status_code, message):
+                return ("Gemini vision istegi kota veya hiz limitine takildi. "
+                        "Biraz bekleyip tekrar dene ya da API planini kontrol et.")
+            if _is_transient_status(response.status_code, message):
+                if attempt < len(retry_delays):
+                    time.sleep(delay)
+                    continue
+                break
+            # kalici hata — bu modeli birak, sonrakini dene
+            break
+
+    return f"Gemini vision istegi basarisiz oldu: {last_error}"
 
 
 def analyze_screen(query: str, target: str = "active_window") -> str:

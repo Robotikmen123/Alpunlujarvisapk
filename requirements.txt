@@ -1,9 +1,10 @@
 # JARVIS Android — Python bağımlılıkları
 # APK derlemesi buildozer.spec'teki 'requirements' satırını kullanır.
 # Bu dosya masaüstünde geliştirme/test için referanstır.
+# Tüm bağımlılıklar saf Python'dur — derlenmiş/Rust bağımlılığı yoktur.
 
 kivy>=2.3.0
-google-genai
+websockets
 requests
 pillow
 

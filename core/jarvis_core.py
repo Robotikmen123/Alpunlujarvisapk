@@ -3,20 +3,23 @@
 JARVIS Android — Gercek zamanli sesli yardimci cekirdegi
 Alp Ünlü tarafından yapılmıştır — @alppunlu
 Android ortamina uyarlanmis calisma akisi (macOS sürümünün portu).
+
+Gemini Live API'sine google-genai SDK'sı yerine saf Python WebSocket
+istemcisiyle (core/gemini_ws.py) bağlanılır; böylece Android için derlenmesi
+zor olan Rust tabanlı bağımlılıklar (pydantic-core) gerekmez.
 """
 
 import asyncio
+import base64
 import datetime
 import re
 import threading
 import traceback
 
-from google import genai  # type: ignore[reportMissingImports]
-from google.genai import types  # type: ignore[reportMissingImports]
-
 from app_config import get_app_config_value
 from core.paths import CORE_DIR
 from core.tools import TOOL_DECLARATIONS
+from core.gemini_ws import GeminiLiveSession
 from bridge.audio_io import create_audio_backend
 
 from memory.memory_manager import (
@@ -62,6 +65,7 @@ class JarvisLive:
         self.audio_in_queue = None
         self.out_queue = None
         self._loop = None
+        self._setup_done = None
         self._is_speaking = False
         self._speaking_lock = threading.Lock()
 
@@ -97,13 +101,7 @@ class JarvisLive:
         if not self._loop or not self.session:
             self.ui.write_log("ERR: JARVIS bağlantısı henüz hazır değil.")
             return
-        asyncio.run_coroutine_threadsafe(
-            self.session.send_client_content(
-                turns={"parts": [{"text": text}]},
-                turn_complete=True,
-            ),
-            self._loop,
-        )
+        asyncio.run_coroutine_threadsafe(self.session.send_text(text), self._loop)
 
     async def _interrupt_audio(self):
         try:
@@ -114,7 +112,7 @@ class JarvisLive:
                     except Exception:
                         break
             if self.session:
-                await self.session.send_realtime_input(audio_stream_end=True)
+                await self.session.send_audio_stream_end()
             self.set_speaking(False)
         except Exception:
             pass
@@ -177,7 +175,7 @@ class JarvisLive:
         normalized = " ".join("".join(cleaned).split())
         return normalized.strip(), had_noise
 
-    def _build_config(self) -> types.LiveConnectConfig:
+    def _build_config(self) -> dict:
         memory = load_memory()
         mem_str = format_memory_for_prompt(memory)
         sys_p = load_system_prompt()
@@ -189,25 +187,25 @@ class JarvisLive:
             parts.append(mem_str + "\n\n")
         parts.append(sys_p)
 
-        return types.LiveConnectConfig(
-            response_modalities=["AUDIO"],
-            output_audio_transcription={},
-            input_audio_transcription={},
-            system_instruction="\n".join(parts),
-            tools=[{"function_declarations": TOOL_DECLARATIONS}],
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name=str(get_app_config_value("voice", "Charon") or "Charon")
-                    )
-                )
-            ),
-        )
+        voice = str(get_app_config_value("voice", "Charon") or "Charon")
+        return {
+            "model": LIVE_MODEL,
+            "generationConfig": {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": {
+                    "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}
+                },
+            },
+            "systemInstruction": {"parts": [{"text": "\n".join(parts)}]},
+            "tools": [{"functionDeclarations": TOOL_DECLARATIONS}],
+            "inputAudioTranscription": {},
+            "outputAudioTranscription": {},
+        }
 
     # ── Araç çalıştırma ──────────────────────────────────────────────────────
-    async def _execute_tool(self, fc) -> types.FunctionResponse:
-        name = fc.name
-        args = dict(fc.args or {})
+    async def _execute_tool(self, fc: dict) -> dict:
+        name = fc.get("name", "")
+        args = dict(fc.get("args") or {})
         print(f"[JARVIS] 🔧 {name} {args}")
         self.ui.set_state("THINKING")
 
@@ -383,7 +381,7 @@ class JarvisLive:
             self.ui.set_state("LISTENING")
 
         print(f"[JARVIS] 📤 {name} → {str(result)[:80]}")
-        return types.FunctionResponse(id=fc.id, name=name, response={"result": result})
+        return {"id": fc.get("id"), "name": name, "response": {"result": result}}
 
     # ── Ses akışı ────────────────────────────────────────────────────────────
     def _on_mic_chunk(self, data: bytes):
@@ -397,7 +395,7 @@ class JarvisLive:
 
         def _enqueue():
             try:
-                self.out_queue.put_nowait({"data": data, "mime_type": "audio/pcm"})
+                self.out_queue.put_nowait(data)
             except asyncio.QueueFull:
                 pass
 
@@ -416,9 +414,10 @@ class JarvisLive:
                 print(f"[JARVIS] ❌ Mikrofon başlatılamadı: {e}")
 
     async def _send_realtime(self):
+        await self._setup_done.wait()
         while True:
-            msg = await self.out_queue.get()
-            await self.session.send_realtime_input(media=msg)
+            pcm = await self.out_queue.get()
+            await self.session.send_audio(pcm)
 
     async def _receive_audio(self):
         print("[JARVIS] 👂 Alım başladı")
@@ -426,65 +425,81 @@ class JarvisLive:
         output_noise = False
         output_noise_samples = []
         try:
-            while True:
-                async for response in self.session.receive():
-                    if response.data:
-                        self.audio_in_queue.put_nowait(response.data)
+            async for evt in self.session.events():
+                if "setupComplete" in evt:
+                    self._setup_done.set()
+                    self.ui.set_state("LISTENING")
+                    self.ui.write_log("SYS: JARVIS hazır. Dinliyorum...")
+                    continue
 
-                    if response.server_content:
-                        sc = response.server_content
-
-                        if sc.output_transcription and sc.output_transcription.text:
+                sc = evt.get("serverContent")
+                if sc:
+                    model_turn = sc.get("modelTurn") or {}
+                    for part in model_turn.get("parts", []) or []:
+                        inline = part.get("inlineData") or {}
+                        data = inline.get("data")
+                        if data:
                             self.set_speaking(True)
-                            raw_txt = sc.output_transcription.text.strip()
-                            if raw_txt:
-                                txt, had_noise = self._clean_transcript_text(raw_txt)
-                                if had_noise:
-                                    output_noise = True
-                                    if len(output_noise_samples) < 4:
-                                        output_noise_samples.append(raw_txt)
-                                if txt:
-                                    out_buf.append(txt)
+                            try:
+                                self.audio_in_queue.put_nowait(base64.b64decode(data))
+                            except Exception:
+                                pass
 
-                        if sc.input_transcription and sc.input_transcription.text:
-                            txt = sc.input_transcription.text.strip()
+                    ot = sc.get("outputTranscription") or {}
+                    if ot.get("text"):
+                        self.set_speaking(True)
+                        raw_txt = ot["text"].strip()
+                        if raw_txt:
+                            txt, had_noise = self._clean_transcript_text(raw_txt)
+                            if had_noise:
+                                output_noise = True
+                                if len(output_noise_samples) < 4:
+                                    output_noise_samples.append(raw_txt)
                             if txt:
-                                in_buf.append(txt)
-                                self.ui.mark_user_activity(True)
+                                out_buf.append(txt)
 
-                        if sc.turn_complete:
-                            self.set_speaking(False)
+                    it = sc.get("inputTranscription") or {}
+                    if it.get("text"):
+                        txt = it["text"].strip()
+                        if txt:
+                            in_buf.append(txt)
+                            self.ui.mark_user_activity(True)
 
-                            full_in = " ".join(in_buf).strip()
-                            if full_in:
-                                self.ui.write_log(f"Siz: {full_in}")
-                            in_buf = []
+                    if sc.get("turnComplete"):
+                        self.set_speaking(False)
 
-                            full_out = " ".join(out_buf).strip()
-                            if full_out:
-                                self.ui.write_log(f"JARVIS: {full_out}")
-                                if output_noise_samples:
-                                    self.ui.write_debug(
-                                        "Kısmen filtrelenen ses transcripti: "
-                                        + " | ".join(output_noise_samples),
-                                        level="WARN",
-                                    )
-                            elif output_noise:
-                                self.ui.write_log(
-                                    "ERR: JARVIS sesli yanıtını çözümlerken bir hata oluştu."
+                        full_in = " ".join(in_buf).strip()
+                        if full_in:
+                            self.ui.write_log(f"Siz: {full_in}")
+                        in_buf = []
+
+                        full_out = " ".join(out_buf).strip()
+                        if full_out:
+                            self.ui.write_log(f"JARVIS: {full_out}")
+                            if output_noise_samples:
+                                self.ui.write_debug(
+                                    "Kısmen filtrelenen ses transcripti: "
+                                    + " | ".join(output_noise_samples),
+                                    level="WARN",
                                 )
-                                self.ui.set_state("ERROR")
-                            out_buf = []
-                            output_noise = False
-                            output_noise_samples = []
+                        elif output_noise:
+                            self.ui.write_log(
+                                "ERR: JARVIS sesli yanıtını çözümlerken bir hata oluştu."
+                            )
+                            self.ui.set_state("ERROR")
+                        out_buf = []
+                        output_noise = False
+                        output_noise_samples = []
 
-                    if response.tool_call:
-                        fn_responses = []
-                        for fc in response.tool_call.function_calls:
-                            print(f"[JARVIS] 📞 {fc.name}")
-                            fr = await self._execute_tool(fc)
-                            fn_responses.append(fr)
-                        await self.session.send_tool_response(function_responses=fn_responses)
+                tool_call = evt.get("toolCall")
+                if tool_call:
+                    fn_responses = []
+                    for fc in tool_call.get("functionCalls", []) or []:
+                        print(f"[JARVIS] 📞 {fc.get('name')}")
+                        fr = await self._execute_tool(fc)
+                        fn_responses.append(fr)
+                    if fn_responses:
+                        await self.session.send_tool_response(fn_responses)
 
         except Exception as e:
             print(f"[JARVIS] ❌ Alım: {e}")
@@ -505,10 +520,7 @@ class JarvisLive:
             self.set_speaking(False)
 
     async def run(self):
-        client = genai.Client(
-            api_key=get_api_key(),
-            http_options={"api_version": "v1alpha"},
-        )
+        api_key = get_api_key()
 
         while True:
             if self._paused:
@@ -520,24 +532,21 @@ class JarvisLive:
                 self.ui.set_state("THINKING")
                 config = self._build_config()
 
-                async with (
-                    client.aio.live.connect(model=LIVE_MODEL, config=config) as session,
-                    asyncio.TaskGroup() as tg,
-                ):
+                async with GeminiLiveSession(api_key, LIVE_MODEL) as session:
                     self.session = session
                     self._loop = asyncio.get_event_loop()
                     self.audio_in_queue = asyncio.Queue()
                     self.out_queue = asyncio.Queue(maxsize=10)
+                    self._setup_done = asyncio.Event()
 
+                    await session.send_setup(config)
                     self._start_mic()
-
                     print("[JARVIS] ✅ Bağlandı.")
-                    self.ui.set_state("LISTENING")
-                    self.ui.write_log("SYS: JARVIS hazır. Dinliyorum...")
 
-                    tg.create_task(self._send_realtime())
-                    tg.create_task(self._receive_audio())
-                    tg.create_task(self._play_audio())
+                    async with asyncio.TaskGroup() as tg:
+                        tg.create_task(self._send_realtime())
+                        tg.create_task(self._receive_audio())
+                        tg.create_task(self._play_audio())
 
             except Exception as e:
                 print(f"[JARVIS] ⚠️ {e}")

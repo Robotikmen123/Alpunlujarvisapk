@@ -23,10 +23,11 @@ source.exclude_patterns = */__pycache__/*,*.pyc
 version = 1.0.0
 
 # ── Bağımlılıklar ────────────────────────────────────────────────────────────
-# google-genai canlı ses API'si websockets kullanır. pydantic (pydantic-core,
-# Rust) bir python-for-android tarifi gerektirir; build ortamında Rust kurulu
-# olmalıdır. audiostream + pyjnius Android ses ve Java köprüsü içindir.
-requirements = python3,kivy==2.3.0,audiostream,pyjnius,android,plyer,pillow,requests,urllib3,certifi,charset-normalizer,idna,sniffio,h11,anyio,httpcore,httpx,websockets,typing-extensions,annotated-types,pydantic,pydantic-core,google-genai
+# Tüm bağımlılıklar saf Python'dur (derlenmiş/Rust bağımlılığı yok). Gemini Live
+# API'sine google-genai SDK'sı yerine doğrudan websockets ile bağlanılır, vision
+# çağrıları requests ile REST üzerinden yapılır. audiostream + pyjnius Android
+# ses ve Java köprüsü içindir; pillow'un python-for-android tarifi vardır.
+requirements = python3,kivy==2.3.0,audiostream,pyjnius,android,plyer,pillow,requests,urllib3,certifi,charset-normalizer,idna,websockets
 
 orientation = portrait
 fullscreen = 0
