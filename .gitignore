@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.DS_Store
+.vscode/
+.idea/
+
+# Buildozer / Android derleme çıktıları
+.buildozer/
+bin/
+*.apk
+*.aab
+
+# Kullanıcıya özel yapılandırma
+config/api_keys.json
+memory/memory.json
+memory/phone_book.json

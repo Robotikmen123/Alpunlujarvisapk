@@ -1,0 +1,16 @@
+# JARVIS Android — Python bağımlılıkları
+# APK derlemesi buildozer.spec'teki 'requirements' satırını kullanır.
+# Bu dosya masaüstünde geliştirme/test için referanstır.
+
+kivy>=2.3.0
+google-genai
+requests
+pillow
+
+# Android'e özel (cihazda buildozer tarafından sağlanır)
+audiostream
+pyjnius
+plyer
+
+# Masaüstü ses yedeği (audiostream yoksa)
+pyaudio
